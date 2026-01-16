@@ -2,15 +2,26 @@ import regex as re
 import os
 import logging
 import time
+import json
 from multiprocessing import Pool
-import tempfile
 
 from collections import Counter, defaultdict
 from tqdm import tqdm
 
-TMP_DIR = "tmp"
-
+# Precompiled regex pattern for pretokenization (GPT-2 style)
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+REGEX_PATTERN = re.compile(PAT)
+
+# Global timing variables for profiling (used in demo/main)
+_GLOBAL_TIMING = {
+    "merge_substeps": {
+        "init_pair_counter": 0.0,
+        "find_frequent_pair": 0.0,
+        "merge_pairs": 0.0,
+        "other_overhead": 0.0,
+        "total": 0.0,
+    }
+}
 
 
 def init_vocab(special_tokens: list[str]) -> list[bytes]:
@@ -19,85 +30,99 @@ def init_vocab(special_tokens: list[str]) -> list[bytes]:
     return vocab
 
 
-def chunk_file(
+def find_chunk_boundaries(
     file_path: str,
+    desired_num_chunks: int,
     split_bytes: bytes = "<|endoftext|>".encode("utf-8"),
-    output_dir: str = TMP_DIR,
-    BUFFER_SIZE: int = 8 * 1024 * 1024,  # 8MB
-) -> list[str]:
-    logging.info(f"Starting file chunking: {file_path}")
-
-    def write_chunk(chunk: bytes, chunk_id: int) -> str:
-        if chunk:  # Skip empty chunks
-            file_name = f"chunk_{chunk_id}.txt"
-            output_path = os.path.join(output_dir, file_name)
-            output_path = os.path.abspath(output_path)
-            with open(output_path, "wb") as out_f:
-                out_f.write(chunk)
-
-            return output_path
-
-        return None
-
-    os.makedirs(output_dir, exist_ok=True)
-    written_files = []
+) -> list[int]:
+    total_size = os.path.getsize(file_path)
+    logging.info(
+        f"Finding chunk boundaries: {file_path} ({total_size:,} bytes, target: {desired_num_chunks} chunks)"
+    )
 
     with open(file_path, "rb") as f:
-        chunk_id = 0
-        buffer = b""
+        # Get total file size
+        f.seek(0, os.SEEK_END)
+        file_size = f.tell()
+        f.seek(0)
 
-        while True:
-            data = f.read(BUFFER_SIZE)
-            if not data:
-                break
+        chunk_size = file_size // desired_num_chunks
 
-            buffer += data
-            special_token_index = buffer.find(split_bytes)
+        # Initial guesses for chunk boundary locations, uniformly spaced
+        chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+        chunk_boundaries[-1] = file_size
 
-            while special_token_index != -1:
-                chunk = buffer[:special_token_index]
-                file_path = write_chunk(chunk, chunk_id)
-                if file_path:
-                    written_files.append(file_path)
-                    chunk_id += 1
+        mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
 
-                buffer = buffer[special_token_index + len(split_bytes) :]
-                special_token_index = buffer.find(split_bytes)
+        # Adjust boundaries to align with document boundaries
+        for bi in range(1, len(chunk_boundaries) - 1):
+            initial_position = chunk_boundaries[bi]
+            f.seek(initial_position)
+            while True:
+                mini_chunk = f.read(mini_chunk_size)
 
-    if buffer:
-        file_path = write_chunk(buffer, chunk_id)
-        if file_path:
-            written_files.append(file_path)
-            chunk_id += 1
+                # If EOF, this boundary should be at the end of the file
+                if mini_chunk == b"":
+                    chunk_boundaries[bi] = file_size
+                    break
 
-    logging.info(f"Finished file chunking: {len(written_files)} chunks created")
-    return written_files
+                # Find the special token in the mini chunk
+                found_at = mini_chunk.find(split_bytes)
+                if found_at != -1:
+                    chunk_boundaries[bi] = initial_position + found_at
+                    break
+                initial_position += mini_chunk_size
+
+        # Make sure all boundaries are unique
+        boundaries = sorted(set(chunk_boundaries))
+
+    logging.info(f"Finished finding boundaries: {len(boundaries) - 1} chunks created")
+    return boundaries
 
 
-def _pretokenize_chunk_worker(chunk_path: str) -> Counter[tuple[bytes, ...]]:
-    """Worker function to pretokenize a single chunk file."""
-    with open(chunk_path, "rb") as f:
-        text = f.read().decode("utf-8", errors="ignore")
-        return pretokenize(text)
+def _pretokenize_chunk_worker(args: tuple[str, int, int]) -> Counter[tuple[bytes, ...]]:
+    file_path, start, end = args
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start)
+        text = chunk.decode("utf-8", errors="ignore")
+
+        # Split by special token to get individual documents
+        # The special token itself should not be pretokenized
+        documents = text.split("<|endoftext|>")
+
+        # Pretokenize each document separately and aggregate
+        total_counter = Counter()
+        for doc in documents:
+            if doc:  # Skip empty strings
+                total_counter.update(pretokenize(doc))
+
+        return total_counter
 
 
 def pretokenize_chunks(
-    chunk_paths: list[str], num_workers: int | None = None
+    file_path: str, boundaries: list[int], num_workers: int | None = None
 ) -> Counter[tuple[bytes, ...]]:
-    """Pretokenize multiple chunks in parallel and aggregate counters."""
+    """Pretokenize file by processing byte ranges in parallel."""
     if num_workers is None:
         num_workers = os.cpu_count() or 1
 
+    num_chunks = len(boundaries) - 1
     logging.info(
-        f"Starting pretokenization of {len(chunk_paths)} chunks with {num_workers} workers"
+        f"Starting pretokenization of {num_chunks} chunks with {num_workers} workers"
     )
 
-    if not chunk_paths:
+    if num_chunks == 0:
         return Counter()
+
+    # Create list of (file_path, start, end) tuples for each chunk
+    chunk_args = [
+        (file_path, boundaries[i], boundaries[i + 1]) for i in range(num_chunks)
+    ]
 
     total_counter = Counter()
     with Pool(processes=num_workers) as pool:
-        for counter in pool.imap_unordered(_pretokenize_chunk_worker, chunk_paths):
+        for counter in pool.imap_unordered(_pretokenize_chunk_worker, chunk_args):
             total_counter.update(counter)
 
     logging.info(
@@ -106,10 +131,12 @@ def pretokenize_chunks(
     return total_counter
 
 
-def pretokenize(text: str, regex_pattern: str = PAT) -> Counter[tuple[bytes, ...]]:
+def pretokenize(
+    text: str, regex_pattern: re.Pattern = REGEX_PATTERN
+) -> Counter[tuple[bytes, ...]]:
     return Counter(
         tuple(bytes([b]) for b in match.group().encode("utf-8"))
-        for match in re.finditer(regex_pattern, text)
+        for match in regex_pattern.finditer(text)
     )
 
 
@@ -154,6 +181,16 @@ def merge_token_pairs(
         merge_counter_time += time.time() - merge_start
 
     total_time = time.time() - total_start
+    other_overhead = total_time - init_time - find_pair_time - merge_counter_time
+
+    # Store timing in global variable for profiling
+    _GLOBAL_TIMING["merge_substeps"] = {
+        "init_pair_counter": init_time,
+        "find_frequent_pair": find_pair_time,
+        "merge_pairs": merge_counter_time,
+        "other_overhead": other_overhead,
+        "total": total_time,
+    }
 
     # Print timing breakdown
     logging.info(f"Finished token merging: {len(merges)} merges completed")
@@ -167,9 +204,7 @@ def merge_token_pairs(
     logging.info(
         f"    - Merge pairs in counter: {merge_counter_time:.2f}s ({merge_counter_time/total_time*100:.1f}%)"
     )
-    logging.info(
-        f"    - Other overhead: {total_time - init_time - find_pair_time - merge_counter_time:.2f}s"
-    )
+    logging.info(f"    - Other overhead: {other_overhead:.2f}s")
     logging.info(f"    - Total: {total_time:.2f}s")
 
     return vocab, merges
@@ -183,15 +218,6 @@ def initialize_pair_counter(
     dict[int, tuple[bytes, ...]],
     dict[int, int],
 ]:
-    """
-    Initialize pair counter and sequence ID mappings.
-
-    Returns:
-        - pair_counter: global frequency of each pair
-        - reversed_index: maps each pair to set of sequence IDs containing it
-        - id_to_tokens: maps sequence ID to token tuple
-        - id_to_count: maps sequence ID to its count/frequency
-    """
     pair_counter = Counter()
     reversed_index = defaultdict(set)
     id_to_tokens = {}
@@ -214,12 +240,6 @@ def initialize_pair_counter(
 def find_most_frequent_pair(
     pair_counter: Counter[tuple[bytes, bytes]],
 ) -> tuple[bytes, bytes]:
-    """
-    Find the most frequent pair in the pair counter.
-
-    Tie-breaking: Among pairs with equal frequency, selects the lexicographically
-    largest pair (based on bytes ordering) for deterministic behavior.
-    """
     return max(pair_counter, key=lambda pair: (pair_counter[pair], pair))
 
 
@@ -230,12 +250,6 @@ def merge_most_frequent_pair_in_counter(
     id_to_tokens: dict[int, tuple[bytes, ...]],
     id_to_count: dict[int, int],
 ) -> None:
-    """
-    Merge the most frequent pair and update data structures accordingly.
-
-    This function modifies pair_counter, reversed_index, and id_to_tokens in-place.
-    id_to_count remains unchanged as sequence counts don't change during merges.
-    """
     # Iterate over a snapshot to avoid "set changed size during iteration" errors
     affected_seq_ids = list(reversed_index[most_frequent_pair])
 
@@ -274,10 +288,11 @@ def merge_most_frequent_pair_in_counter(
             pair_counter[pair] -= pair_count * count
             new_count = pair_counter[pair]
 
-            assert new_count >= 0, (
-                f"Pair counter went negative for pair {pair}: "
-                f"old_count={old_count}, subtracted={pair_count * count}, new_count={new_count}"
-            )
+            if new_count < 0:
+                raise ValueError(
+                    f"Pair counter went negative for pair {pair}: "
+                    f"old_count={old_count}, subtracted={pair_count * count}, new_count={new_count}"
+                )
 
             if pair_counter[pair] == 0:
                 del pair_counter[pair]
@@ -311,37 +326,84 @@ def train_bpe(
     vocab_size: int,
     special_tokens: list[str],
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """
-    Train a BPE tokenizer on the input text.
-    """
     logging.info("=" * 80)
     logging.info(f"Starting BPE training")
     logging.info(f"  Input: {input_path}")
     logging.info(f"  Target vocab size: {vocab_size}")
     logging.info(f"  Special tokens: {special_tokens}")
 
-    # Use temporary directory for chunk files that cleans up automatically
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        # Step 1: Chunk file
-        chunk_paths = chunk_file(input_path, output_dir=tmp_dir)
-        logging.info(f"[STEP 1/4] Chunking completed")
+    training_start = time.time()
+    timing_breakdown = {}
 
-        # Step 2: Initialize vocab
-        vocab = init_vocab(special_tokens)
-        logging.info(
-            f"[STEP 2/4] Vocab initialization completed (initial vocab size: {len(vocab)})"
-        )
+    # Step 1: Find chunk boundaries (divides file into byte ranges)
+    step_start = time.time()
+    num_chunks = os.cpu_count() or 1  # Use number of CPU cores
+    boundaries = find_chunk_boundaries(input_path, num_chunks)
+    timing_breakdown["chunking"] = time.time() - step_start
+    logging.info(f"[STEP 1/4] Chunking completed ({timing_breakdown['chunking']:.2f}s)")
 
-        # Step 3: Pretokenize
-        pretokens_counter = pretokenize_chunks(chunk_paths)
-        logging.info(f"[STEP 3/4] Pretokenization completed")
+    # Step 2: Initialize vocab
+    step_start = time.time()
+    vocab = init_vocab(special_tokens)
+    timing_breakdown["vocab_init"] = time.time() - step_start
+    logging.info(
+        f"[STEP 2/4] Vocab initialization completed (initial vocab size: {len(vocab)}, {timing_breakdown['vocab_init']:.2f}s)"
+    )
 
-    # Step 4: Merge tokens (temp directory cleaned up after pretokenization)
+    # Step 3: Pretokenize
+    step_start = time.time()
+    pretokens_counter = pretokenize_chunks(input_path, boundaries)
+    timing_breakdown["pretokenization"] = time.time() - step_start
+    logging.info(
+        f"[STEP 3/4] Pretokenization completed ({timing_breakdown['pretokenization']:.2f}s)"
+    )
+
+    # Step 4: Merge tokens
+    step_start = time.time()
     num_merges = vocab_size - len(special_tokens) - 256
     vocab, merges = merge_token_pairs(vocab, pretokens_counter, num_merges)
-    logging.info(f"[STEP 4/4] Token merging completed")
+    timing_breakdown["token_merging"] = time.time() - step_start
+    logging.info(
+        f"[STEP 4/4] Token merging completed ({timing_breakdown['token_merging']:.2f}s)"
+    )
 
+    total_time = time.time() - training_start
+
+    # Print timing summary
+    logging.info("=" * 80)
     logging.info(f"BPE training completed (final vocab size: {len(vocab)})")
+    logging.info(f"")
+    logging.info(f"TIMING SUMMARY:")
+    logging.info(
+        f"  Step 1 - Chunking:          {timing_breakdown['chunking']:>8.2f}s ({timing_breakdown['chunking']/total_time*100:>5.1f}%)"
+    )
+    logging.info(
+        f"  Step 2 - Vocab Init:        {timing_breakdown['vocab_init']:>8.2f}s ({timing_breakdown['vocab_init']/total_time*100:>5.1f}%)"
+    )
+    logging.info(
+        f"  Step 3 - Pretokenization:   {timing_breakdown['pretokenization']:>8.2f}s ({timing_breakdown['pretokenization']/total_time*100:>5.1f}%)"
+    )
+    logging.info(
+        f"  Step 4 - Token Merging:     {timing_breakdown['token_merging']:>8.2f}s ({timing_breakdown['token_merging']/total_time*100:>5.1f}%)"
+    )
+
+    # Print merge substep breakdown from global timing
+    merge_timing = _GLOBAL_TIMING["merge_substeps"]
+    logging.info(
+        f"    ├─ Init pair counter:     {merge_timing['init_pair_counter']:>8.2f}s ({merge_timing['init_pair_counter']/total_time*100:>5.1f}%)"
+    )
+    logging.info(
+        f"    ├─ Find frequent pair:    {merge_timing['find_frequent_pair']:>8.2f}s ({merge_timing['find_frequent_pair']/total_time*100:>5.1f}%)"
+    )
+    logging.info(
+        f"    ├─ Merge pairs:           {merge_timing['merge_pairs']:>8.2f}s ({merge_timing['merge_pairs']/total_time*100:>5.1f}%)"
+    )
+    logging.info(
+        f"    └─ Other overhead:        {merge_timing['other_overhead']:>8.2f}s ({merge_timing['other_overhead']/total_time*100:>5.1f}%)"
+    )
+
+    logging.info(f"  {'─' * 50}")
+    logging.info(f"  Total Training Time:        {total_time:>8.2f}s (100.0%)")
     logging.info("=" * 80)
 
     return {i: token for i, token in enumerate(vocab)}, merges
@@ -353,12 +415,34 @@ def main():
     )
 
     vocab, merges = train_bpe(
-        input_path="tests/fixtures/corpus.en",
-        vocab_size=500,
+        input_path="data/TinyStoriesV2-GPT4-train.txt",
+        vocab_size=10000,
         special_tokens=["<|endoftext|>"],
     )
-    print(vocab)
-    print(merges)
+
+    # Create output directory
+    output_dir = "./out"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save vocab as JSON (convert bytes to base64 strings for JSON serialization)
+    vocab_path = os.path.join(output_dir, "tokenizer.json")
+    vocab_serializable = {
+        str(idx): token.decode("utf-8", errors="replace")
+        for idx, token in vocab.items()
+    }
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(vocab_serializable, f, ensure_ascii=False, indent=2)
+    logging.info(f"Vocab saved to {vocab_path}")
+
+    # Save merges as text file (one merge per line, similar to GPT-2 format)
+    merges_path = os.path.join(output_dir, "merges.txt")
+    with open(merges_path, "w", encoding="utf-8") as f:
+        for token1, token2 in merges:
+            # Decode bytes to string, replacing any invalid UTF-8 with replacement character
+            token1_str = token1.decode("utf-8", errors="replace")
+            token2_str = token2.decode("utf-8", errors="replace")
+            f.write(f"{token1_str} {token2_str}\n")
+    logging.info(f"Merges saved to {merges_path}")
 
 
 if __name__ == "__main__":
