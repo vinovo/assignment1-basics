@@ -415,8 +415,8 @@ def main():
     )
 
     vocab, merges = train_bpe(
-        input_path="data/TinyStoriesV2-GPT4-train.txt",
-        vocab_size=10000,
+        input_path="data/owt_train.txt",
+        vocab_size=32000,
         special_tokens=["<|endoftext|>"],
     )
 
