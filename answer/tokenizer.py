@@ -18,23 +18,7 @@ class Tokenizer:
         self.merges = merges
         special_tokens = special_tokens or []
 
-        if special_tokens:
-            for token in special_tokens:
-                self.vocab[len(self.vocab)] = token.encode("utf-8")
-
         self.reversed_vocab = {v: k for k, v in self.vocab.items()}
-
-        # Build pretokenization pattern with special tokens
-        if special_tokens:
-            # Escape special regex characters and join with |
-            escaped_special = [re.escape(token) for token in special_tokens]
-            special_pattern = "|".join(escaped_special)
-            # Put special tokens first so they match before the general pattern
-            full_pattern = f"({special_pattern})|{self.PAT}"
-            self.pretokenize_regex = re.compile(full_pattern)
-        else:
-            self.pretokenize_regex = self.PRETOKENIZE_REGEX_PATTERN
-
         self.special_tokens = set(special_tokens)
 
     @classmethod
@@ -48,15 +32,48 @@ class Tokenizer:
         return cls(vocab, merges, special_tokens)
 
     def pretokenize(self, text: str) -> Iterable[list[tuple[bytes, ...]]]:
+        # Pass 1: Find all special token positions and split text
+        special_token_positions = []  # List of (start_pos, end_pos, token)
+        
+        # Scan through text to find all special tokens
+        pos = 0
+        while pos < len(text):
+            matched = False
+            for special_token in self.special_tokens:
+                if text[pos:pos+len(special_token)] == special_token:
+                    special_token_positions.append((pos, pos + len(special_token), special_token))
+                    pos += len(special_token)
+                    matched = True
+                    break
+            if not matched:
+                pos += 1
+        
+        # Split into text_parts and special_tokens_found
+        # We'll have len(special_tokens_found) + 1 text parts
+        text_parts = []
+        special_tokens_found = []
+        last_pos = 0
+        
+        for start, end, token in special_token_positions:
+            text_parts.append(text[last_pos:start])  # Text before this special token (could be empty)
+            special_tokens_found.append(token)
+            last_pos = end
+        text_parts.append(text[last_pos:])  # Text after last special token (could be empty)
+        
+        # Pass 2: Process each text part with regex, then interleave with special tokens
         result = []
-        for match in self.pretokenize_regex.finditer(text):
-            matched_text = match.group()
-            # If this is a special token, keep it as a single unit
-            if matched_text in self.special_tokens:
-                result.append((matched_text.encode("utf-8"),))
-            else:
-                # Otherwise, break it into bytes
-                result.append(tuple(bytes([b]) for b in matched_text.encode("utf-8")))
+        
+        for i, text_part in enumerate(text_parts):
+            # Process this text part with regex (skip if empty)
+            if text_part:
+                for match in self.PRETOKENIZE_REGEX_PATTERN.finditer(text_part):
+                    matched_text = match.group()
+                    result.append(tuple(bytes([b]) for b in matched_text.encode("utf-8")))
+            
+            # Add special token after this text part (if one exists)
+            if i < len(special_tokens_found):
+                result.append((special_tokens_found[i].encode("utf-8"),))
+        
         return result
 
     def encode(self, text: str) -> list[int]:
@@ -69,6 +86,10 @@ class Tokenizer:
         ]
 
     def merge_token(self, tokens: tuple[bytes, ...]) -> tuple[bytes, ...]:
+        # special tuples that hold special tokens
+        if len(tokens) == 1 and tokens[0] in self.special_tokens:
+            return tokens
+
         pair_merge = True
 
         while pair_merge:
@@ -84,64 +105,39 @@ class Tokenizer:
     def try_merge_pair_on_tokens(
         self, tokens: tuple[bytes, ...], merge: tuple[bytes, bytes]
     ) -> tuple[bool, tuple[bytes, ...]]:
-        merged_bytes = merge[0] + merge[1]
-        i = j = 0
-        merge_indices = []
-        merge_start = 0
+        i = 0
+        merge_indices = set()
 
-        # first iter, find all the indices to merge first
         while i < len(tokens) - 1:
-            token = tokens[i]
-
-            if token in self.special_tokens:
-                # current match needs to stop when hitting a special token
-                j = 0
-                merge_start = i + 1
-                i += 1
-                continue
-
-            if merged_bytes[j:].startswith(token):
-                if j + len(token) == len(merged_bytes):
-                    # found a merge, reset the pointers
-                    merge_indices.append((merge_start, i + 1))
-                    j = 0
-                    merge_start = i + 1
-                # not getting to the end of merged bytes yet
-                else:
-                    j += len(token)
-            # if the match is not found
+            if (tokens[i], tokens[i + 1]) == merge:
+                merge_indices.add(i)
+                i += 2
             else:
-                j = 0
-                merge_start = i + 1
-
-            i += 1
+                i += 1
 
         if not merge_indices:
             return False, tokens
 
         # actualy apply the merges
         new_tokens = []
-        i = j = 0
+        i = 0
 
-        while i < len(tokens):
-            if j < len(merge_indices) and i == merge_indices[j][0]:
-                end_index = merge_indices[j][1]
-                merged_token = b"".join(tokens[i:end_index])
-                new_tokens.append(merged_token)
-                i = end_index
-                j += 1
+        while i < len(tokens) - 1:
+            if i in merge_indices:
+                new_tokens.append(tokens[i] + tokens[i + 1])
+                i += 2
             else:
                 new_tokens.append(tokens[i])
                 i += 1
 
-        # assert all have been merged
-        assert j == len(merge_indices)
+        if i == len(tokens) - 1:
+            new_tokens.append(tokens[i])
 
-        return True, new_tokens
+        return True, tuple(new_tokens)
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
         for text in iterable:
-            yield self.encode(text)
+            yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        return b"".join(self.vocab[id] for id in ids).decode("utf-8", errors="replace")
+        return b"".join(self.vocab[id_] for id_ in ids).decode("utf-8", errors="replace")

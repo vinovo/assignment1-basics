@@ -11,6 +11,7 @@ from tqdm import tqdm
 # Precompiled regex pattern for pretokenization (GPT-2 style)
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 REGEX_PATTERN = re.compile(PAT)
+DEFAULT_NUM_WORKERS = 4
 
 # Global timing variables for profiling (used in demo/main)
 _GLOBAL_TIMING = {
@@ -105,7 +106,7 @@ def pretokenize_chunks(
 ) -> Counter[tuple[bytes, ...]]:
     """Pretokenize file by processing byte ranges in parallel."""
     if num_workers is None:
-        num_workers = os.cpu_count() or 1
+        num_workers = DEFAULT_NUM_WORKERS
 
     num_chunks = len(boundaries) - 1
     logging.info(
