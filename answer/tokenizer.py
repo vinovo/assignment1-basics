@@ -3,6 +3,104 @@ from typing import Iterable
 import regex as re
 
 
+def parse_merges_file(filepath: str) -> list[tuple[bytes, bytes]]:
+    """
+    Parse a merges file where each line contains two tokens separated by a space.
+    
+    The merge file uses Ġ (U+0120) as a replacement for spaces within tokens,
+    so we can simply split by space and replace Ġ back to spaces.
+    
+    Args:
+        filepath: Path to the merges file
+        
+    Returns:
+        List of merge pairs as tuples of bytes
+    """
+    merges = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip('\n\r')  # Remove line endings
+            
+            if not line:  # Skip empty lines
+                continue
+            
+            # Split by space (the separator between the two tokens)
+            parts = line.split(' ')
+            if len(parts) != 2:
+                raise ValueError(f"Could not parse merge line: {repr(line)} - expected exactly 2 tokens")
+            
+            token1_str, token2_str = parts
+            
+            # Replace Ġ back to spaces
+            token1_str = token1_str.replace("Ġ", " ")
+            token2_str = token2_str.replace("Ġ", " ")
+            
+            merges.append((token1_str.encode('utf-8'), token2_str.encode('utf-8')))
+    
+    return merges
+
+
+# OLD COMPLEX LOGIC (commented out for reference):
+# def parse_merges_file_old(filepath: str) -> list[tuple[bytes, bytes]]:
+#     """
+#     OLD: Parse a merges file where each line contains two tokens separated by a space.
+#     
+#     Since tokens can start with spaces (but spaces can only occur at the beginning),
+#     we parse each line as:
+#     {possible whitespace from token 1}{char part from token 1} {possible whitespace from token 2}{char part from token 2}
+#     
+#     Strategy: Find the first non-space character of token2 (scanning backwards),
+#     then find the leftmost space in the sequence of spaces before it. This ensures
+#     token2 gets any leading spaces per the pretokenization rules.
+#     """
+#     merges = []
+#     with open(filepath, "r") as f:
+#         for line in f:
+#             line = line.rstrip('\n\r')
+#             
+#             if not line or len(line) <= 1:
+#                 continue
+#             
+#             if line.strip() == '':
+#                 split_pos = len(line) // 2
+#                 token1 = line[:split_pos]
+#                 token2 = line[split_pos + 1:]
+#             else:
+#                 last_non_space = -1
+#                 for i in range(len(line) - 1, -1, -1):
+#                     if line[i] != ' ':
+#                         last_non_space = i
+#                         break
+#                 
+#                 first_non_space_in_token2 = last_non_space
+#                 for i in range(last_non_space, -1, -1):
+#                     if line[i] == ' ':
+#                         first_non_space_in_token2 = i + 1
+#                         break
+#                     if i == 0:
+#                         raise ValueError(f"Could not parse merge line: {repr(line)}")
+#                 
+#                 split_pos = first_non_space_in_token2 - 1
+#                 
+#                 if split_pos < 0 or line[split_pos] != ' ':
+#                     raise ValueError(f"Could not parse merge line: {repr(line)}")
+#                 
+#                 while split_pos > 0 and line[split_pos - 1] == ' ':
+#                     split_pos -= 1
+#                 
+#                 if split_pos == 0:
+#                     if first_non_space_in_token2 == 1:
+#                         raise ValueError(f"Could not parse merge line: {repr(line)} - only one space before token2")
+#                     split_pos = first_non_space_in_token2 - 1
+#                 
+#                 token1 = line[:split_pos]
+#                 token2 = line[split_pos + 1:]
+#             
+#             merges.append((token1.encode('utf-8'), token2.encode('utf-8')))
+#     
+#     return merges
+
+
 class Tokenizer:
 
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -19,16 +117,20 @@ class Tokenizer:
         special_tokens = special_tokens or []
 
         self.reversed_vocab = {v: k for k, v in self.vocab.items()}
-        self.special_tokens = set(special_tokens)
+        # Sort special tokens by length (longest first) to match longer tokens before shorter ones
+        self.special_tokens = sorted(set(special_tokens), key=len, reverse=True)
 
     @classmethod
     def from_files(
         cls, vocav_filepath: str, merges_filepath: str, special_tokens: list[str] = None
     ):
         with open(vocav_filepath, "r") as f:
-            vocab = json.load(f)
-        with open(merges_filepath, "r") as f:
-            merges = [tuple(line.strip().split().encode("utf-8")) for line in f]
+            vocab_json = json.load(f)
+        
+        # Convert vocab from JSON format (str keys, str values) to expected format (int keys, bytes values)
+        vocab = {int(k): v.encode('utf-8') for k, v in vocab_json.items()}
+        
+        merges = parse_merges_file(merges_filepath)
         return cls(vocab, merges, special_tokens)
 
     def pretokenize(self, text: str) -> Iterable[list[tuple[bytes, ...]]]:

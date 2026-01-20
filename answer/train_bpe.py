@@ -425,7 +425,7 @@ def main():
     output_dir = "./out"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save vocab as JSON (convert bytes to base64 strings for JSON serialization)
+    # Save vocab as JSON (convert bytes to strings for JSON serialization)
     vocab_path = os.path.join(output_dir, "tokenizer.json")
     vocab_serializable = {
         str(idx): token.decode("utf-8", errors="replace")
@@ -436,12 +436,16 @@ def main():
     logging.info(f"Vocab saved to {vocab_path}")
 
     # Save merges as text file (one merge per line, similar to GPT-2 format)
+    # Replace spaces with Ġ (U+0120) to avoid ambiguity with the separator space
     merges_path = os.path.join(output_dir, "merges.txt")
     with open(merges_path, "w", encoding="utf-8") as f:
         for token1, token2 in merges:
             # Decode bytes to string, replacing any invalid UTF-8 with replacement character
             token1_str = token1.decode("utf-8", errors="replace")
             token2_str = token2.decode("utf-8", errors="replace")
+            # Replace spaces with Ġ character
+            token1_str = token1_str.replace(" ", "Ġ")
+            token2_str = token2_str.replace(" ", "Ġ")
             f.write(f"{token1_str} {token2_str}\n")
     logging.info(f"Merges saved to {merges_path}")
 
