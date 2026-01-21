@@ -40,67 +40,6 @@ def parse_merges_file(filepath: str) -> list[tuple[bytes, bytes]]:
     return merges
 
 
-# OLD COMPLEX LOGIC (commented out for reference):
-# def parse_merges_file_old(filepath: str) -> list[tuple[bytes, bytes]]:
-#     """
-#     OLD: Parse a merges file where each line contains two tokens separated by a space.
-#     
-#     Since tokens can start with spaces (but spaces can only occur at the beginning),
-#     we parse each line as:
-#     {possible whitespace from token 1}{char part from token 1} {possible whitespace from token 2}{char part from token 2}
-#     
-#     Strategy: Find the first non-space character of token2 (scanning backwards),
-#     then find the leftmost space in the sequence of spaces before it. This ensures
-#     token2 gets any leading spaces per the pretokenization rules.
-#     """
-#     merges = []
-#     with open(filepath, "r") as f:
-#         for line in f:
-#             line = line.rstrip('\n\r')
-#             
-#             if not line or len(line) <= 1:
-#                 continue
-#             
-#             if line.strip() == '':
-#                 split_pos = len(line) // 2
-#                 token1 = line[:split_pos]
-#                 token2 = line[split_pos + 1:]
-#             else:
-#                 last_non_space = -1
-#                 for i in range(len(line) - 1, -1, -1):
-#                     if line[i] != ' ':
-#                         last_non_space = i
-#                         break
-#                 
-#                 first_non_space_in_token2 = last_non_space
-#                 for i in range(last_non_space, -1, -1):
-#                     if line[i] == ' ':
-#                         first_non_space_in_token2 = i + 1
-#                         break
-#                     if i == 0:
-#                         raise ValueError(f"Could not parse merge line: {repr(line)}")
-#                 
-#                 split_pos = first_non_space_in_token2 - 1
-#                 
-#                 if split_pos < 0 or line[split_pos] != ' ':
-#                     raise ValueError(f"Could not parse merge line: {repr(line)}")
-#                 
-#                 while split_pos > 0 and line[split_pos - 1] == ' ':
-#                     split_pos -= 1
-#                 
-#                 if split_pos == 0:
-#                     if first_non_space_in_token2 == 1:
-#                         raise ValueError(f"Could not parse merge line: {repr(line)} - only one space before token2")
-#                     split_pos = first_non_space_in_token2 - 1
-#                 
-#                 token1 = line[:split_pos]
-#                 token2 = line[split_pos + 1:]
-#             
-#             merges.append((token1.encode('utf-8'), token2.encode('utf-8')))
-#     
-#     return merges
-
-
 class Tokenizer:
 
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -119,6 +58,16 @@ class Tokenizer:
         self.reversed_vocab = {v: k for k, v in self.vocab.items()}
         # Sort special tokens by length (longest first) to match longer tokens before shorter ones
         self.special_tokens = sorted(set(special_tokens), key=len, reverse=True)
+        self.special_tokens_set = set(token.encode('utf-8') for token in self.special_tokens)
+        
+        if self.special_tokens:
+            # Escape special regex chars and join with | (alternation)
+            pattern = '|'.join(re.escape(token) for token in self.special_tokens)
+            self.special_token_regex = re.compile(pattern)
+        else:
+            self.special_token_regex = None
+        
+        self.merge_priority = {merge: i for i, merge in enumerate(self.merges)}
 
     @classmethod
     def from_files(
@@ -134,49 +83,31 @@ class Tokenizer:
         return cls(vocab, merges, special_tokens)
 
     def pretokenize(self, text: str) -> Iterable[list[tuple[bytes, ...]]]:
-        # Pass 1: Find all special token positions and split text
-        special_token_positions = []  # List of (start_pos, end_pos, token)
-        
-        # Scan through text to find all special tokens
-        pos = 0
-        while pos < len(text):
-            matched = False
-            for special_token in self.special_tokens:
-                if text[pos:pos+len(special_token)] == special_token:
-                    special_token_positions.append((pos, pos + len(special_token), special_token))
-                    pos += len(special_token)
-                    matched = True
-                    break
-            if not matched:
-                pos += 1
-        
-        # Split into text_parts and special_tokens_found
-        # We'll have len(special_tokens_found) + 1 text parts
-        text_parts = []
-        special_tokens_found = []
-        last_pos = 0
-        
-        for start, end, token in special_token_positions:
-            text_parts.append(text[last_pos:start])  # Text before this special token (could be empty)
-            special_tokens_found.append(token)
-            last_pos = end
-        text_parts.append(text[last_pos:])  # Text after last special token (could be empty)
-        
-        # Pass 2: Process each text part with regex, then interleave with special tokens
-        result = []
-        
-        for i, text_part in enumerate(text_parts):
-            # Process this text part with regex (skip if empty)
-            if text_part:
-                for match in self.PRETOKENIZE_REGEX_PATTERN.finditer(text_part):
-                    matched_text = match.group()
-                    result.append(tuple(bytes([b]) for b in matched_text.encode("utf-8")))
+        if self.special_token_regex:
+            # Split text by special tokens while keeping the delimiters
+            parts = self.special_token_regex.split(text)
+            tokens = self.special_token_regex.findall(text)
             
-            # Add special token after this text part (if one exists)
-            if i < len(special_tokens_found):
-                result.append((special_tokens_found[i].encode("utf-8"),))
-        
-        return result
+            # Interleave text parts and special tokens
+            result = []
+            for i, text_part in enumerate(parts):
+                if text_part:
+                    for match in self.PRETOKENIZE_REGEX_PATTERN.finditer(text_part):
+                        matched_text = match.group()
+                        result.append(tuple(bytes([b]) for b in matched_text.encode("utf-8")))
+                
+                # Add special token after this text part (if one exists)
+                if i < len(tokens):
+                    result.append((tokens[i].encode("utf-8"),))
+            
+            return result
+        else:
+            # No special tokens, just use regex pattern
+            result = []
+            for match in self.PRETOKENIZE_REGEX_PATTERN.finditer(text):
+                matched_text = match.group()
+                result.append(tuple(bytes([b]) for b in matched_text.encode("utf-8")))
+            return result
 
     def encode(self, text: str) -> list[int]:
         token_groups = self.pretokenize(text)
@@ -188,54 +119,49 @@ class Tokenizer:
         ]
 
     def merge_token(self, tokens: tuple[bytes, ...]) -> tuple[bytes, ...]:
-        # special tuples that hold special tokens
-        if len(tokens) == 1 and tokens[0] in self.special_tokens:
+        # special tokens should not be merged with other tokens
+        if len(tokens) == 1 and tokens[0] in self.special_tokens_set:
             return tokens
 
-        pair_merge = True
 
-        while pair_merge:
-            pair_merge = False
-            for merge in self.merges:
-                pair_merge, tokens = self.try_merge_pair_on_tokens(tokens, merge)
-                # we have at least found one merge
-                if pair_merge:
-                    break
+        tokens = list(tokens)
+        
 
-        return tokens
+        while True:
+            # Find the highest priority (lowest index) merge that exists in tokens
+            best_merge = None
+            best_priority = len(self.merges)
+            best_positions = []
+            
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                if pair in self.merge_priority:
+                    priority = self.merge_priority[pair]
+                    if priority < best_priority:
+                        best_priority = priority
+                        best_merge = pair
+                        best_positions = [i]
+                    elif priority == best_priority:
+                        best_positions.append(i)
+            
+            if best_merge is None:
+                break
+            
+            # Apply this merge at all positions (non-overlapping)
+            # Process from right to left to maintain indices
+            merge_indices = set()
+            for i in reversed(best_positions):
+                # Check if this position is still valid (not overlapping with a previous merge)
+                if i not in merge_indices and i + 1 not in merge_indices:
+                    merge_indices.add(i)
+            
+            # Apply merges from right to left
+            for i in sorted(merge_indices, reverse=True):
+                tokens[i] = tokens[i] + tokens[i + 1]
+                tokens.pop(i + 1)
+        
+        return tuple(tokens)
 
-    def try_merge_pair_on_tokens(
-        self, tokens: tuple[bytes, ...], merge: tuple[bytes, bytes]
-    ) -> tuple[bool, tuple[bytes, ...]]:
-        i = 0
-        merge_indices = set()
-
-        while i < len(tokens) - 1:
-            if (tokens[i], tokens[i + 1]) == merge:
-                merge_indices.add(i)
-                i += 2
-            else:
-                i += 1
-
-        if not merge_indices:
-            return False, tokens
-
-        # actualy apply the merges
-        new_tokens = []
-        i = 0
-
-        while i < len(tokens) - 1:
-            if i in merge_indices:
-                new_tokens.append(tokens[i] + tokens[i + 1])
-                i += 2
-            else:
-                new_tokens.append(tokens[i])
-                i += 1
-
-        if i == len(tokens) - 1:
-            new_tokens.append(tokens[i])
-
-        return True, tuple(new_tokens)
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
         for text in iterable:
