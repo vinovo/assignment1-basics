@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from answer.transformers.softmax import softmax
+from answer.transformers.rope import RoPE
 
 def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     d_k = Q.shape[-1]
@@ -15,7 +16,7 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
 
 
 class MultiheadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, max_seq_len: int = 8192, device: torch.device | None = None, dtype: torch.dtype | None = None):
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int = 8192, theta: float = 10000, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
         self.d_model = d_model
         self.d_k = self.d_v = d_model // num_heads
@@ -30,7 +31,9 @@ class MultiheadAttention(nn.Module):
         mask = ~torch.triu(torch.ones(max_seq_len, max_seq_len, device=device, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", mask)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.rope = RoPE(theta=10000, d_k=self.d_k, max_seq_len=max_seq_len, device=device)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         # shape of x is (batch_size, seq_len, d_model)
 
         # do projection
@@ -52,6 +55,10 @@ class MultiheadAttention(nn.Module):
 
         # unbind to (batch_size, num_heads, seq_len, d_k)
         q, k, v = x.unbind(dim=-3)
+        if token_positions is not None:
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+
         mask = self.causal_mask[:q.shape[-2], :k.shape[-2]]
         mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len_q, seq_len_k)
         mask = mask.expand(q.shape[0], q.shape[1], -1, -1)

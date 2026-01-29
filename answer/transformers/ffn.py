@@ -1,13 +1,16 @@
 import torch
 import torch.nn as nn
 
+from answer.transformers.linear import Linear
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int | None = None, device: torch.device | None = None, dtype: torch.dtype | None = None):
         super().__init__()
         self.d_ff = d_ff = self._dff_from_dmodel(d_model) if not d_ff else d_ff
-        self.w1 = nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(d_model, d_ff, device=device, dtype=dtype))
-        self.w3 = nn.Parameter(torch.empty(d_ff, d_model, device=device, dtype=dtype))
+        # correspond to W1, W2, W3
+        self.ln1 = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.ln2 = Linear(d_ff, d_model, device=device, dtype=dtype)
+        self.ln3 = Linear(d_model, d_ff, device=device, dtype=dtype)
 
     @staticmethod
     def _dff_from_dmodel(d_model: int) -> int:
@@ -26,6 +29,5 @@ class SwiGLU(nn.Module):
     def _silu(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(x)
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (self._silu(x @ self.w1.T) * (x @ self.w3.T)) @ self.w2.T
+        return self.ln2(self._silu(self.ln1(x)) * (self.ln3(x)))

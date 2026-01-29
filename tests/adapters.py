@@ -89,9 +89,9 @@ def run_swiglu(
     # swiglu.w3.weight.data = w3_weight
     from answer.transformers.ffn import SwiGLU
     swiglu = SwiGLU(d_model, d_ff, device=w1_weight.device, dtype=w1_weight.dtype)
-    swiglu.w1.data = w1_weight
-    swiglu.w2.data = w2_weight
-    swiglu.w3.data = w3_weight
+    swiglu.ln1.weights.data = w1_weight
+    swiglu.ln2.weights.data = w2_weight
+    swiglu.ln3.weights.data = w3_weight
     return swiglu(in_features)
 
 
@@ -192,7 +192,11 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from answer.transformers.attn import MultiheadAttention
+    multihead_attention = MultiheadAttention(d_model, num_heads, max_seq_len, theta, device=q_proj_weight.device, dtype=q_proj_weight.dtype)
+    multihead_attention.proj_weights.data = torch.stack([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+    multihead_attention.W_O.data = o_proj_weight
+    return multihead_attention(in_features, token_positions)
 
 
 def run_rope(
@@ -289,7 +293,17 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    from answer.transformers.transformer_block import TransformerBlock
+    transformer_block = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, device=weights['attn.q_proj.weight'].device, dtype=weights['attn.q_proj.weight'].dtype)
+    transformer_block.mha.proj_weights.data = torch.stack([weights['attn.q_proj.weight'], weights['attn.k_proj.weight'], weights['attn.v_proj.weight']], dim=0)
+    transformer_block.mha.W_O.data = weights['attn.output_proj.weight']
+    transformer_block.ffn.w1.data = weights['ffn.w1.weight']
+    transformer_block.ffn.w2.data = weights['ffn.w2.weight']
+    transformer_block.ffn.w3.data = weights['ffn.w3.weight']
+    transformer_block.rms1.g.data = weights['ln1.weight']
+    transformer_block.rms2.g.data = weights['ln2.weight']
+
+    return transformer_block(in_features)
 
 
 def run_transformer_lm(
@@ -371,7 +385,20 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from answer.transformers.transformer_lm import TransformerLM
+    transformer_lm = TransformerLM(d_model, num_heads, d_ff, vocab_size, context_length, num_layers, rope_theta, device=weights['token_embeddings.weight'].device, dtype=weights['token_embeddings.weight'].dtype)
+    transformer_lm.embedding.embedding.data = weights['token_embeddings.weight']
+    for i in range(num_layers):
+        transformer_lm.transformer_blocks[i].mha.proj_weights.data = torch.stack([weights[f'layers.{i}.attn.q_proj.weight'], weights[f'layers.{i}.attn.k_proj.weight'], weights[f'layers.{i}.attn.v_proj.weight']], dim=0)
+        transformer_lm.transformer_blocks[i].mha.W_O.data = weights[f'layers.{i}.attn.output_proj.weight']
+        transformer_lm.transformer_blocks[i].ffn.w1.data = weights[f'layers.{i}.ffn.w1.weight']
+        transformer_lm.transformer_blocks[i].ffn.w2.data = weights[f'layers.{i}.ffn.w2.weight']
+        transformer_lm.transformer_blocks[i].ffn.w3.data = weights[f'layers.{i}.ffn.w3.weight']
+        transformer_lm.transformer_blocks[i].rms1.g.data = weights[f'layers.{i}.ln1.weight']
+        transformer_lm.transformer_blocks[i].rms2.g.data = weights[f'layers.{i}.ln2.weight']
+    transformer_lm.norm.g.data = weights['ln_final.weight']
+    transformer_lm.linear.weights.data = weights['lm_head.weight']
+    return transformer_lm(in_indices)
 
 
 def run_rmsnorm(
