@@ -128,12 +128,12 @@ def main():
     params = {
         'model_name': 'GPT-2 XL (long context)',
         'vocab_size': 50257,
-        'context_length': 16384,
+        'context_length': 1024,
         'num_layers': 48,
         'd_model': 1600,
         'num_heads': 25,
         'd_ff': 6400,
-        'batch_size': 1,  # Batch size per forward pass
+        'batch_size': 1024,  # Batch size per forward pass
     }
     
     print("=" * 80)
