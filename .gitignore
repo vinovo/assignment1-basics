@@ -166,3 +166,4 @@ data/
 tmp/
 *-out/
 out-*/
+checkpoints/
