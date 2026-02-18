@@ -8,6 +8,8 @@ from multiprocessing import Pool
 from collections import Counter, defaultdict
 from tqdm import tqdm
 
+from answer.tokenizer import bytes_to_str
+
 # Precompiled regex pattern for pretokenization (GPT-2 style)
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 REGEX_PATTERN = re.compile(PAT)
@@ -416,8 +418,8 @@ def main():
     )
 
     vocab, merges = train_bpe(
-        input_path="data/owt_train.txt",
-        vocab_size=32000,
+        input_path="data/TinyStoriesV2-GPT4-train.txt",
+        vocab_size=10000,
         special_tokens=["<|endoftext|>"],
     )
 
@@ -425,28 +427,19 @@ def main():
     output_dir = "./out"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Save vocab as JSON (convert bytes to strings for JSON serialization)
     vocab_path = os.path.join(output_dir, "tokenizer.json")
     vocab_serializable = {
-        str(idx): token.decode("utf-8", errors="replace")
+        str(idx): bytes_to_str(token)
         for idx, token in vocab.items()
     }
     with open(vocab_path, "w", encoding="utf-8") as f:
         json.dump(vocab_serializable, f, ensure_ascii=False, indent=2)
     logging.info(f"Vocab saved to {vocab_path}")
 
-    # Save merges as text file (one merge per line, similar to GPT-2 format)
-    # Replace spaces with Ġ (U+0120) to avoid ambiguity with the separator space
     merges_path = os.path.join(output_dir, "merges.txt")
     with open(merges_path, "w", encoding="utf-8") as f:
         for token1, token2 in merges:
-            # Decode bytes to string, replacing any invalid UTF-8 with replacement character
-            token1_str = token1.decode("utf-8", errors="replace")
-            token2_str = token2.decode("utf-8", errors="replace")
-            # Replace spaces with Ġ character
-            token1_str = token1_str.replace(" ", "Ġ")
-            token2_str = token2_str.replace(" ", "Ġ")
-            f.write(f"{token1_str} {token2_str}\n")
+            f.write(f"{bytes_to_str(token1)} {bytes_to_str(token2)}\n")
     logging.info(f"Merges saved to {merges_path}")
 
 

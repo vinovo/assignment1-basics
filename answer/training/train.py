@@ -19,7 +19,8 @@ CHECKPOINT_INTERVAL = 100
 EVAL_INTERVAL = 10
 EVAL_ITERS = 10
 
-# Schema: (section, key, type, default or None if required)
+# Schema: (section, cfg_key, type, default_or_None, [dict_key])
+# When dict_key is provided, it overrides cfg_key as the output dict key.
 CONFIG_SCHEMA = [
     # Experiment metadata
     ("experiment", "name", str, None),
@@ -36,7 +37,7 @@ CONFIG_SCHEMA = [
     ("optimizer", "lr", float, 6e-4),
     ("optimizer", "beta1", float, 0.9),
     ("optimizer", "beta2", float, 0.999),
-    ("optimizer", "eps", float, 1e-8),
+    ("optimizer", "eps", float, 1e-8, "optimizer_eps"),
     ("optimizer", "weight_decay", float, 0.01),
     # LR scheduler hyperparameters
     ("lr_scheduler", "lr_max", float, 6e-4),
@@ -57,7 +58,10 @@ def load_config(path: str) -> dict:
     parser.read(path)
 
     config = {}
-    for section, key, typ, default in CONFIG_SCHEMA:
+    for entry in CONFIG_SCHEMA:
+        section, cfg_key, typ, default = entry[:4]
+        dict_key = entry[4] if len(entry) > 4 else cfg_key
+
         if typ is int:
             getter = parser.getint
         elif typ is float:
@@ -66,10 +70,9 @@ def load_config(path: str) -> dict:
             getter = parser.get
 
         if default is None:
-            # Required field — will raise if missing
-            config[key] = getter(section, key)
+            config[dict_key] = getter(section, cfg_key)
         else:
-            config[key] = getter(section, key, fallback=default)
+            config[dict_key] = getter(section, cfg_key, fallback=default)
 
     return config
 
@@ -113,6 +116,7 @@ def train(
     metrics_path = os.path.join(checkpoint_folder, "metrics.jsonl")
 
     model = TransformerLM(d_model, num_heads, d_ff, vocab_size, context_length, num_layers, theta, eps)
+    model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=lr, betas=(beta1, beta2), eps=optimizer_eps, weight_decay=weight_decay)
 
     wall_start = time.time()
@@ -172,9 +176,6 @@ def main():
 
     experiment_name = config.pop("name")
     checkpoint_folder = args.checkpoint_folder or os.path.join("./checkpoints", experiment_name)
-
-    # Rename to avoid collision with model eps
-    config["optimizer_eps"] = config.pop("eps")
 
     train_data, val_data = load_data(args.train_data, args.val_data)
 

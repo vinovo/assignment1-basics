@@ -31,7 +31,7 @@ class MultiheadAttention(nn.Module):
         mask = ~torch.triu(torch.ones(max_seq_len, max_seq_len, device=device, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", mask)
 
-        self.rope = RoPE(theta=10000, d_k=self.d_k, max_seq_len=max_seq_len, device=device)
+        self.rope = RoPE(theta=theta, d_k=self.d_k, max_seq_len=max_seq_len, device=device)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
         # shape of x is (batch_size, seq_len, d_model)

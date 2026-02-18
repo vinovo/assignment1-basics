@@ -297,9 +297,9 @@ def run_transformer_block(
     transformer_block = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, device=weights['attn.q_proj.weight'].device, dtype=weights['attn.q_proj.weight'].dtype)
     transformer_block.mha.proj_weights.data = torch.stack([weights['attn.q_proj.weight'], weights['attn.k_proj.weight'], weights['attn.v_proj.weight']], dim=0)
     transformer_block.mha.W_O.data = weights['attn.output_proj.weight']
-    transformer_block.ffn.w1.data = weights['ffn.w1.weight']
-    transformer_block.ffn.w2.data = weights['ffn.w2.weight']
-    transformer_block.ffn.w3.data = weights['ffn.w3.weight']
+    transformer_block.ffn.ln1.weights.data = weights['ffn.w1.weight']
+    transformer_block.ffn.ln2.weights.data = weights['ffn.w2.weight']
+    transformer_block.ffn.ln3.weights.data = weights['ffn.w3.weight']
     transformer_block.rms1.g.data = weights['ln1.weight']
     transformer_block.rms2.g.data = weights['ln2.weight']
 
@@ -391,9 +391,9 @@ def run_transformer_lm(
     for i in range(num_layers):
         transformer_lm.transformer_blocks[i].mha.proj_weights.data = torch.stack([weights[f'layers.{i}.attn.q_proj.weight'], weights[f'layers.{i}.attn.k_proj.weight'], weights[f'layers.{i}.attn.v_proj.weight']], dim=0)
         transformer_lm.transformer_blocks[i].mha.W_O.data = weights[f'layers.{i}.attn.output_proj.weight']
-        transformer_lm.transformer_blocks[i].ffn.w1.data = weights[f'layers.{i}.ffn.w1.weight']
-        transformer_lm.transformer_blocks[i].ffn.w2.data = weights[f'layers.{i}.ffn.w2.weight']
-        transformer_lm.transformer_blocks[i].ffn.w3.data = weights[f'layers.{i}.ffn.w3.weight']
+        transformer_lm.transformer_blocks[i].ffn.ln1.weights.data = weights[f'layers.{i}.ffn.w1.weight']
+        transformer_lm.transformer_blocks[i].ffn.ln2.weights.data = weights[f'layers.{i}.ffn.w2.weight']
+        transformer_lm.transformer_blocks[i].ffn.ln3.weights.data = weights[f'layers.{i}.ffn.w3.weight']
         transformer_lm.transformer_blocks[i].rms1.g.data = weights[f'layers.{i}.ln1.weight']
         transformer_lm.transformer_blocks[i].rms2.g.data = weights[f'layers.{i}.ln2.weight']
     transformer_lm.norm.g.data = weights['ln_final.weight']
@@ -438,7 +438,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    from answer.transformers.ffn import SwiGLU
+    return SwiGLU._silu(None, in_features)
 
 
 def run_get_batch(
